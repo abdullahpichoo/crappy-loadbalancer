@@ -14,24 +14,35 @@ import (
 )
 
 type serverPool struct {
-	servers  []server.ServerInstance
-	mux      sync.RWMutex
-	lbConfig config.LbConfig
-	logger   *log.Logger
-	logChan  chan string
+	servers             []server.ServerInstance
+	mux                 sync.RWMutex
+	lbConfig            config.LbConfig
+	logger              *log.Logger
+	logChan             chan string
+	currRRServerIdx     int
+	additionalServerMux sync.RWMutex
 }
 
 type ServerPool interface {
 	InitServers() error
-	GetLeastConnectionServer() string
 	AddServer(url string) (server.ServerInstance, error)
-	RecordRequestLifeCycle(url string, requestChannel <-chan string) error
 	GetAllServers() []server.ServerInstance
 	GetActiveServers() []server.ServerInstance
-	RemoveServer(url string) error
 	RestartServer(url string)
 	RequestHandler(w http.ResponseWriter, r *http.Request)
 	LogServerPoolStatus(ctx context.Context)
+	SendMessage(string)
+}
+
+func New(lbConfig config.LbConfig, logger *log.Logger) ServerPool {
+	return &serverPool{
+		servers:             []server.ServerInstance{},
+		mux:                 sync.RWMutex{},
+		lbConfig:            lbConfig,
+		logger:              logger,
+		logChan:             make(chan string),
+		additionalServerMux: sync.RWMutex{},
+	}
 }
 
 func (s *serverPool) InitServers() error {
@@ -48,71 +59,11 @@ func (s *serverPool) InitServers() error {
 func (s *serverPool) GetActiveServers() []server.ServerInstance {
 	var servers []server.ServerInstance
 	for _, srv := range s.servers {
-		if srv.IsAlive() {
+		if srv.IsAlive() && srv.IsHealthy() {
 			servers = append(servers, srv)
 		}
 	}
 	return servers
-}
-
-func (s *serverPool) GetLeastConnectionServer() string {
-	servers := s.GetActiveServers()
-	if len(servers) == 0 {
-		return s.lbConfig.DefaultServerAddr
-	}
-
-	var (
-		leastConnectionServerUrl = s.lbConfig.DefaultServerAddr
-		minConnections           = int32(math.MaxInt32)
-		needsNewServer           = true
-	)
-
-	for _, srv := range servers {
-		stats := srv.GetMetrics()
-
-		if stats.ActiveRequests < int32(s.lbConfig.MaxConnsPerServer) {
-			needsNewServer = false
-		}
-
-		if stats.ActiveRequests < minConnections {
-			minConnections = stats.ActiveRequests
-			leastConnectionServerUrl = srv.GetUrl()
-		}
-	}
-
-	if needsNewServer {
-		url, err := bootUpAdditionalServer(s)
-		if err != nil {
-			return leastConnectionServerUrl
-		}
-		return url
-	}
-
-	return leastConnectionServerUrl
-}
-
-func (s *serverPool) RecordRequestLifeCycle(url string, requestChannel <-chan string) error {
-	srv, err := findServerByUrl(s, url)
-
-	if err != nil {
-		return fmt.Errorf("failed to find the server by url")
-	}
-	srv.IncrementActiveRequests()
-	defer srv.DecrementActiveRequests()
-
-	select {
-	case result := <-requestChannel:
-		switch result {
-		case "success":
-			srv.RecordRequestResult(true)
-		case "failed":
-			srv.RecordRequestResult(false)
-		}
-	case <-time.After(31 * time.Second):
-		srv.RecordRequestResult(false)
-	}
-
-	return nil
 }
 
 func (s *serverPool) AddServer(url string) (server.ServerInstance, error) {
@@ -129,8 +80,49 @@ func (s *serverPool) AddServer(url string) (server.ServerInstance, error) {
 		return nil, fmt.Errorf("failed to add new server: %s", err.Error())
 	}
 
+	isReady := waitTillServerReady(url)
+	if !isReady {
+		server.Kill()
+		s.logChan <- "unable to start new server " + url
+		return nil, fmt.Errorf("unable to start new server %s", url)
+	}
+
 	s.servers = append(s.servers, server)
 	return server, nil
+}
+
+func (s *serverPool) RestartServer(url string) {
+	s.mux.Lock()
+	defer s.mux.Unlock()
+
+	server, err := findServerByUrl(s, url)
+	if err != nil {
+		s.logChan <- err.Error()
+		return
+	}
+
+	server.SetIsHealthy(false)
+	if err := server.Kill(); err != nil {
+		s.logChan <- err.Error()
+		return
+	}
+
+	time.Sleep(1 * time.Second)
+
+	_, err = server.BootUp()
+	if err != nil {
+		s.logChan <- err.Error()
+		return
+	}
+
+	isReady := waitTillServerReady(url)
+	if !isReady {
+		server.Kill()
+		s.logChan <- "unable to start new server " + url
+		return
+	}
+
+	server.SetIsHealthy(true)
 }
 
 func (s *serverPool) GetAllServers() []server.ServerInstance {
@@ -140,28 +132,96 @@ func (s *serverPool) GetAllServers() []server.ServerInstance {
 	return s.servers
 }
 
-func (s *serverPool) RestartServer(url string) {
+func (s *serverPool) rotate() server.ServerInstance {
 	s.mux.Lock()
-	defer s.mux.Unlock()
+	s.currRRServerIdx = (s.currRRServerIdx + 1) % len(s.GetActiveServers())
+	s.mux.Unlock()
+	return s.servers[s.currRRServerIdx]
+}
 
-	server, err := findServerByUrl(s, url)
+func (s *serverPool) roundRobinNextPeer() (server.ServerInstance, error) {
+	for range s.GetActiveServers() {
+		nextPeer := s.rotate()
+		if !nextPeer.IsAlive() {
+			continue
+		}
+		if nextPeer.GetMetrics().ActiveRequests >= int32(s.lbConfig.MaxConnsPerServer) {
+			go func() {
+				_, err := bootUpAdditionalServer(s)
+				if err != nil {
+					s.logChan <- err.Error()
+				}
+			}()
+		}
+		return nextPeer, nil
+	}
+	return nil, fmt.Errorf("error selecting a valid peer")
+}
+
+func (s *serverPool) leastConnectionNextPeer() (server.ServerInstance, error) {
+	servers := s.GetActiveServers()
+	if len(servers) == 0 {
+		return nil, fmt.Errorf("no server initialized")
+	}
+
+	var (
+		leastConnectionServer = s.servers[0]
+		minConnections        = int32(math.MaxInt32)
+		needsNewServer        = true
+	)
+
+	for _, srv := range servers {
+		stats := srv.GetMetrics()
+
+		if stats.ActiveRequests < int32(s.lbConfig.MaxConnsPerServer) {
+			needsNewServer = false
+		}
+
+		if stats.ActiveRequests < minConnections {
+			minConnections = stats.ActiveRequests
+			leastConnectionServer = srv
+		}
+	}
+
+	if needsNewServer {
+		go func() {
+			_, err := bootUpAdditionalServer(s)
+			if err != nil {
+				s.logChan <- err.Error()
+			}
+		}()
+
+	}
+
+	return leastConnectionServer, nil
+}
+
+func (s *serverPool) getValidPeer() (server.ServerInstance, error) {
+	strategy := s.lbConfig.Strategy
+	if strategy == "round-robin" {
+		return s.roundRobinNextPeer()
+	} else {
+		return s.leastConnectionNextPeer()
+	}
+}
+
+func (s *serverPool) shutdownServerPool() {
+	for _, srv := range s.servers {
+		s.logger.Println("killing server ", srv.GetUrl())
+		if err := srv.Kill(); err != nil {
+			s.logger.Println("failed to kill this server")
+		}
+	}
+}
+
+func (s *serverPool) RequestHandler(w http.ResponseWriter, r *http.Request) {
+	lcServer, err := s.getValidPeer()
 	if err != nil {
-		return
+		s.logChan <- err.Error()
+		http.Error(w, "failed to find a valid peer", http.StatusInternalServerError)
 	}
 
-	server.SetIsHealthy(false)
-	time.Sleep(200 * time.Millisecond)
-
-	if err := server.Kill(); err != nil {
-		return
-	}
-
-	_, err = server.BootUp()
-	if err != nil {
-		return
-	}
-
-	server.SetIsHealthy(true)
+	lcServer.GetReverseProxy().ServeHTTP(w, r)
 }
 
 func (s *serverPool) LogServerPoolStatus(ctx context.Context) {
@@ -191,7 +251,7 @@ func (s *serverPool) LogServerPoolStatus(ctx context.Context) {
 					msg = ""
 				}
 
-				for _, server := range s.GetActiveServers() {
+				for _, server := range s.servers {
 					s.logger.Printf("%s Healthy %v - Active: %d Failed: %d Successful: %d\n", server.GetUrl(),
 						server.IsHealthy(),
 						server.GetMetrics().ActiveRequests,
@@ -203,74 +263,11 @@ func (s *serverPool) LogServerPoolStatus(ctx context.Context) {
 	}()
 }
 
-func (s *serverPool) getValidPeer() (server.ServerInstance, error) {
-	servers := s.GetActiveServers()
-	if len(servers) == 0 {
-		return nil, fmt.Errorf("no server initialized")
-	}
-
-	var (
-		leastConnectionServer = s.servers[0]
-		minConnections        = int32(math.MaxInt32)
-		// needsNewServer        = true
-	)
-
-	for _, srv := range servers {
-		stats := srv.GetMetrics()
-
-		// if stats.ActiveRequests < int32(s.lbConfig.MaxConnsPerServer) {
-		// 	needsNewServer = false
-		// }
-
-		if stats.ActiveRequests < minConnections {
-			minConnections = stats.ActiveRequests
-			leastConnectionServer = srv
-		}
-	}
-
-	// if needsNewServer {
-	// 	url, err := bootUpAdditionalServer(s)
-	// 	if err != nil {
-	// 		return leastConnectionServer, nil
-	// 	}
-	// 	return url
-	// }
-
-	return leastConnectionServer, nil
-}
-
-func (s *serverPool) shutdownServerPool() {
-	for _, srv := range s.servers {
-		s.logger.Println("killing server ", srv.GetUrl())
-		if err := srv.Kill(); err != nil {
-			s.logger.Println("failed to kill this server")
-		}
-	}
-}
-
-func (s *serverPool) RequestHandler(w http.ResponseWriter, r *http.Request) {
-	lcServer, err := s.getValidPeer()
-	if err != nil {
-		http.Error(w, "failed to find a valid peer", http.StatusInternalServerError)
-	}
-
-	lcServer.GetReverseProxy().ServeHTTP(w, r)
-}
-
-func New(lbConfig config.LbConfig, logger *log.Logger) ServerPool {
-	return &serverPool{
-		servers:  []server.ServerInstance{},
-		mux:      sync.RWMutex{},
-		lbConfig: lbConfig,
-		logger:   logger,
-		logChan:  make(chan string),
-	}
+func (s *serverPool) SendMessage(msg string) {
+	s.logChan <- msg
 }
 
 func getAddrForNewServer(s *serverPool) (string, error) {
-	s.mux.Lock()
-	defer s.mux.Unlock()
-
 	for _, addr := range s.lbConfig.ServerAddrs {
 		if !isServerAlreadyInServerPool(s, addr) {
 			return addr, nil
@@ -281,7 +278,7 @@ func getAddrForNewServer(s *serverPool) (string, error) {
 }
 
 func isServerAlreadyInServerPool(s *serverPool, addr string) bool {
-	for _, srv := range s.GetActiveServers() {
+	for _, srv := range s.GetAllServers() {
 		if addr == srv.GetUrl() {
 			return true
 		}
@@ -298,19 +295,40 @@ func findServerByUrl(s *serverPool, url string) (server.ServerInstance, error) {
 	return nil, fmt.Errorf("failed to find the server with url %s", url)
 }
 
-func bootUpAdditionalServer(s *serverPool) (string, error) {
+func bootUpAdditionalServer(s *serverPool) (server.ServerInstance, error) {
 	if len(s.GetActiveServers()) >= int(s.lbConfig.MaxNumOfServers) {
-		return "", fmt.Errorf("already max servers reached")
+		return nil, fmt.Errorf("already max servers reached")
 	}
+
+	s.additionalServerMux.Lock()
+	defer time.Sleep(2 * time.Second)
+	defer s.additionalServerMux.Unlock()
+
 	url, err := getAddrForNewServer(s)
 	if err != nil {
-		return "", fmt.Errorf("failed to add new server: %v", err)
+		return nil, fmt.Errorf("failed to add new server: %v", err)
 	}
 
-	_, err = s.AddServer(url)
+	srv, err := s.AddServer(url)
 	if err != nil {
-		return "", fmt.Errorf("failed to add new server: %v", err)
+		return nil, fmt.Errorf("failed to add new server: %v", err)
 	}
 
-	return url, nil
+	return srv, nil
+}
+
+func waitTillServerReady(url string) bool {
+	endpoint := url + "/api/health"
+
+	for i := 0; i < 10; i++ {
+		client := &http.Client{
+			Timeout: 1 * time.Second,
+		}
+		resp, err := client.Get(endpoint)
+		if err == nil && resp.StatusCode == http.StatusOK {
+			return true
+		}
+		time.Sleep(1 * time.Second)
+	}
+	return false
 }

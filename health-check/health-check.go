@@ -1,6 +1,7 @@
 package healthcheck
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"time"
@@ -14,12 +15,19 @@ type HealthChecker struct {
 	ServerPool serverpool.ServerPool
 }
 
-func (hc *HealthChecker) Start() {
-	ticker := time.NewTicker(hc.Interval)
-
+func (hc *HealthChecker) Start(ctx context.Context) {
 	go func() {
-		for range ticker.C {
-			hc.checkAllServers()
+		ticker := time.NewTicker(hc.Interval)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				hc.checkAllServers()
+
+			}
 		}
 	}()
 }
@@ -28,7 +36,7 @@ func (hc *HealthChecker) checkAllServers() {
 	for _, srv := range hc.ServerPool.GetActiveServers() {
 		isHealthy := hc.healthCheck(srv.GetUrl())
 		if !isHealthy {
-			hc.ServerPool.RestartServer(srv.GetUrl())
+			go hc.ServerPool.RestartServer(srv.GetUrl())
 		}
 	}
 }
@@ -48,13 +56,13 @@ func (hc *HealthChecker) healthCheck(url string) bool {
 	for i := 0; i < successThreshold; i++ {
 		resp, err := hc.Client.Do(req)
 		if err != nil {
-			fmt.Printf("Health check failed for %s: %v", url, err)
+			hc.ServerPool.SendMessage(fmt.Sprintf("Health check failed for %s: %v", url, err))
 			return false
 		}
 		defer resp.Body.Close()
 
 		if resp.StatusCode != http.StatusOK {
-			fmt.Printf("Unhealthy status code from %s: %d", url, resp.StatusCode)
+			hc.ServerPool.SendMessage(fmt.Sprintf("Unhealthy status code from %s: %d", url, resp.StatusCode))
 			return false
 		}
 		successCount += 1

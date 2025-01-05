@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 type serverStatus string
@@ -46,7 +47,6 @@ type ServerInstance interface {
 	GetUrl() string
 	BootUp() (ServerInstance, error)
 	Kill() error
-	SetIsAlive(bool)
 	SetIsHealthy(bool)
 	IsHealthy() bool
 	GetMetrics() ReadOnlyServerMetrics
@@ -93,17 +93,6 @@ func (s *server) Kill() error {
 	}
 	s.status = dead
 	return nil
-}
-
-func (s *server) SetIsAlive(isAlive bool) {
-	s.mux.Lock()
-	defer s.mux.Unlock()
-
-	if isAlive {
-		s.status = alive
-	} else {
-		s.status = dead
-	}
 }
 
 func (s *server) SetIsHealthy(isHealthy bool) {
@@ -184,6 +173,11 @@ func createReverseProxy(srv *server) *httputil.ReverseProxy {
 	proxy.Director = func(req *http.Request) {
 		originalDirector(req)
 		srv.metrics.ActiveRequests.Add(1)
+	}
+	proxy.Transport = &http.Transport{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 100,
+		IdleConnTimeout:     90 * time.Second,
 	}
 	proxy.ModifyResponse = srv.rpModifyResponse
 	proxy.ErrorHandler = srv.rpErrorHandler

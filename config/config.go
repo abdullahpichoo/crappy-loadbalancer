@@ -5,5 +5,6 @@ type LbConfig struct {
 	DefaultServerAddr  string
 	InitialServerAddrs []string
 	MaxConnsPerServer  uint16
+	Strategy           string
 	ServerAddrs        []string
 }
