@@ -6,6 +6,7 @@ import (
 	"log"
 	"math"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -83,7 +84,7 @@ func (s *serverPool) AddServer(url string) (server.ServerInstance, error) {
 	isReady := waitTillServerReady(url)
 	if !isReady {
 		server.Kill()
-		s.logChan <- "unable to start new server " + url
+		s.SendMessage("unable to start new server " + url)
 		return nil, fmt.Errorf("unable to start new server %s", url)
 	}
 
@@ -97,13 +98,13 @@ func (s *serverPool) RestartServer(url string) {
 
 	server, err := findServerByUrl(s, url)
 	if err != nil {
-		s.logChan <- err.Error()
+		s.SendMessage(err.Error())
 		return
 	}
 
 	server.SetIsHealthy(false)
 	if err := server.Kill(); err != nil {
-		s.logChan <- err.Error()
+		s.SendMessage(err.Error())
 		return
 	}
 
@@ -111,14 +112,14 @@ func (s *serverPool) RestartServer(url string) {
 
 	_, err = server.BootUp()
 	if err != nil {
-		s.logChan <- err.Error()
+		s.SendMessage(err.Error())
 		return
 	}
 
 	isReady := waitTillServerReady(url)
 	if !isReady {
 		server.Kill()
-		s.logChan <- "unable to start new server " + url
+		s.SendMessage("unable to start new server " + url)
 		return
 	}
 
@@ -149,7 +150,7 @@ func (s *serverPool) roundRobinNextPeer() (server.ServerInstance, error) {
 			go func() {
 				_, err := bootUpAdditionalServer(s)
 				if err != nil {
-					s.logChan <- err.Error()
+					s.SendMessage(err.Error())
 				}
 			}()
 		}
@@ -187,7 +188,7 @@ func (s *serverPool) leastConnectionNextPeer() (server.ServerInstance, error) {
 		go func() {
 			_, err := bootUpAdditionalServer(s)
 			if err != nil {
-				s.logChan <- err.Error()
+				s.SendMessage(err.Error())
 			}
 		}()
 
@@ -217,50 +218,11 @@ func (s *serverPool) shutdownServerPool() {
 func (s *serverPool) RequestHandler(w http.ResponseWriter, r *http.Request) {
 	lcServer, err := s.getValidPeer()
 	if err != nil {
-		s.logChan <- err.Error()
+		s.SendMessage(err.Error())
 		http.Error(w, "failed to find a valid peer", http.StatusInternalServerError)
 	}
 
 	lcServer.GetReverseProxy().ServeHTTP(w, r)
-}
-
-func (s *serverPool) LogServerPoolStatus(ctx context.Context) {
-	go func() {
-		ticker := time.NewTicker(100 * time.Millisecond)
-		defer ticker.Stop()
-
-		var msg string
-		var msgDuration time.Time
-
-		for {
-			select {
-			case <-ctx.Done():
-				s.logger.Println("gracefully shutting down serverpool")
-				s.shutdownServerPool()
-				return
-			case newMsg := <-s.logChan:
-				msg = newMsg
-				msgDuration = time.Now().Add(3 * time.Second)
-			case <-ticker.C:
-				s.logger.Print("\033[H\033[2J")
-				s.logger.Println("Server Status:")
-
-				if time.Now().Before(msgDuration) {
-					s.logger.Println("----- ", msg)
-				} else {
-					msg = ""
-				}
-
-				for _, server := range s.servers {
-					s.logger.Printf("%s Healthy %v - Active: %d Failed: %d Successful: %d\n", server.GetUrl(),
-						server.IsHealthy(),
-						server.GetMetrics().ActiveRequests,
-						server.GetMetrics().FailedRequests,
-						server.GetMetrics().SuccessfulRequests)
-				}
-			}
-		}
-	}()
 }
 
 func (s *serverPool) SendMessage(msg string) {
@@ -331,4 +293,104 @@ func waitTillServerReady(url string) bool {
 		time.Sleep(1 * time.Second)
 	}
 	return false
+}
+
+func (s *serverPool) LogServerPoolStatus(ctx context.Context) {
+	go func() {
+		ticker := time.NewTicker(100 * time.Millisecond)
+		defer ticker.Stop()
+
+		var msg string
+		var msgDuration time.Time
+
+		const (
+			colorReset  = "\033[0m"
+			colorGreen  = "\033[32m"
+			colorRed    = "\033[31m"
+			colorYellow = "\033[33m"
+			colorBlue   = "\033[34m"
+			colorCyan   = "\033[36m"
+
+			boxTopLeft     = "╔"
+			boxTopRight    = "╗"
+			boxBottomLeft  = "╚"
+			boxBottomRight = "╝"
+			boxHorizontal  = "═"
+			boxVertical    = "║"
+			boxTeeRight    = "╠"
+			boxTeeLeft     = "╣"
+		)
+
+		for {
+			select {
+			case <-ctx.Done():
+				s.logger.Println("Gracefully shutting down serverpool")
+				s.shutdownServerPool()
+				return
+			case newMsg := <-s.logChan:
+				msg = newMsg
+				msgDuration = time.Now().Add(3 * time.Second)
+			case <-ticker.C:
+				// pretty printing thanks to claude
+				s.logger.Print("\033[H\033[2J")
+
+				header := " Server Status Dashboard "
+				borderWidth := 80
+				padding := (borderWidth - len(header)) / 2
+
+				s.logger.Printf("%s%s%s%s%s\n",
+					boxTopLeft,
+					strings.Repeat(boxHorizontal, padding),
+					colorCyan+header+colorReset,
+					strings.Repeat(boxHorizontal, padding),
+					boxTopRight)
+
+				if time.Now().Before(msgDuration) {
+					s.logger.Printf("%s %s%s%s %s\n",
+						boxVertical,
+						colorYellow,
+						msg,
+						colorReset,
+						boxVertical)
+					s.logger.Printf("%s%s%s\n",
+						boxTeeRight,
+						strings.Repeat(boxHorizontal, borderWidth),
+						boxTeeLeft)
+				}
+
+				for _, server := range s.servers {
+					metrics := server.GetMetrics()
+					healthStatus := colorGreen + "HEALTHY" + colorReset
+					if !server.IsHealthy() {
+						healthStatus = colorRed + "UNHEALTHY" + colorReset
+					}
+
+					s.logger.Printf("%s %-20s | %s | Active: %s%-4d%s | Failed: %s%-4d%s | Success: %s%-4d%s %s\n",
+						boxVertical,
+						server.GetUrl(),
+						healthStatus,
+						colorBlue,
+						metrics.ActiveRequests,
+						colorReset,
+						colorRed,
+						metrics.FailedRequests,
+						colorReset,
+						colorGreen,
+						metrics.SuccessfulRequests,
+						colorReset,
+						boxVertical)
+				}
+
+				s.logger.Printf("%s%s%s\n",
+					boxBottomLeft,
+					strings.Repeat(boxHorizontal, borderWidth),
+					boxBottomRight)
+
+				s.logger.Printf("\nLast updated: %s%s%s\n",
+					colorCyan,
+					time.Now().Format("2006-01-02 15:04:05"),
+					colorReset)
+			}
+		}
+	}()
 }
