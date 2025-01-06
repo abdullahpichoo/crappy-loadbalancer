@@ -1,0 +1,12 @@
+{
+  "max_num_of_servers": 4,
+  "initial_server_addrs": ["http://localhost:3000"],
+  "server_addrs": [
+    "http://localhost:3000",
+    "http://localhost:3001",
+    "http://localhost:3002",
+    "http://localhost:3003"
+  ],
+  "strategy": "round-robin",
+  "max_conns_per_server": 800
+}

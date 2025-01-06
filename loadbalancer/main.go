@@ -19,21 +19,12 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	lbConfig := config.LbConfig{
-		MaxNumOfServers:   4,
-		DefaultServerAddr: "http://localhost:3000",
-		InitialServerAddrs: []string{
-			"http://localhost:3000",
-		},
-		MaxConnsPerServer: 800,
-		ServerAddrs: []string{
-			"http://localhost:3000", "http://localhost:3001", "http://localhost:3002",
-			"http://localhost:3003",
-		},
-		Strategy: "round-robin",
+	lbConfig, err := config.GetConfig()
+	if err != nil {
+		log.Fatal(err)
 	}
 
-	serverPool := serverpool.New(lbConfig, log)
+	serverPool := serverpool.New(*lbConfig, log)
 	serverPoolHealthChecker := healthcheck.NewHealthChecker(serverPool, 5*time.Second, 8*time.Second)
 
 	if err := serverPool.InitServers(); err != nil {
@@ -61,7 +52,7 @@ func main() {
 		}
 	}()
 
-	log.Println("Reverse Proxy is running on localhost:8080")
+	log.Println("Loadbalancer is running on localhost:8080")
 	if err := server.ListenAndServe(); err != nil {
 		log.Printf("Could not start server: %s\n", err.Error())
 	}
