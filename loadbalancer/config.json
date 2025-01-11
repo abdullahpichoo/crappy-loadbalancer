@@ -1,6 +1,6 @@
 {
   "max_num_of_servers": 4,
-  "initial_server_addrs": ["http://localhost:3000"],
+  "initial_server_addrs": ["http://localhost:3000","http://localhost:3001"],
   "server_addrs": [
     "http://localhost:3000",
     "http://localhost:3001",

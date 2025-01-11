@@ -22,12 +22,11 @@ func NewServerHandler(logger *log.Logger) http.Handler {
 func StartServer(addr string, logger *log.Logger) error {
 	handler := NewServerHandler(logger)
 	server := http.Server{
-		Addr:           addr,
-		Handler:        handler,
-		ReadTimeout:    30 * time.Second,
-		WriteTimeout:   30 * time.Second,
-		IdleTimeout:    60 * time.Second,
-		MaxHeaderBytes: 1 << 20,
+		Addr:         addr,
+		Handler:      handler,
+		ReadTimeout:  30 * time.Second,
+		WriteTimeout: 30 * time.Second,
+		IdleTimeout:  60 * time.Second,
 	}
 
 	log.Printf("server has started on addr %s", addr)
